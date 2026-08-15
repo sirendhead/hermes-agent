@@ -9,10 +9,12 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import type {
-  ConnectionRegistry} from './connection-registry';
+import type { ConnectionRegistry } from './connection-registry'
 import {
   agentHandle,
+  backendScopeKey,
+  backendScopePrefix,
+  buildAgentRoster,
   connectionIdForLabel,
   labelKey,
   labelSlug,
@@ -25,6 +27,7 @@ import {
   removeConnection,
   setPrimaryConnection,
   uniqueLabel,
+  updateEligibility,
   upsertConnection
 } from './connection-registry'
 
@@ -71,11 +74,113 @@ test('uniqueLabel counts up (never "X 2 2") and clamps long candidates', () => {
   assert.ok(uniqueLabel(long, [uniqueLabel(long, [])]).length <= 64)
 })
 
+// --- backendScopeKey (composite pool keys) ---
+
+// The electron and @hermes/shared implementations MUST stay byte-identical —
+// the renderer keys its socket registry with the shared copy while the main
+// process keys the backend pool with this one. This contract test is the
+// enforcement (see the NOTE on backendScopeKey).
+test('backendScopeKey: electron and shared implementations agree everywhere', async () => {
+  // Non-literal specifier on purpose: tsconfig.electron.json's project
+  // boundary excludes apps/shared sources, but vitest resolves the workspace
+  // package fine at runtime — which is exactly what this test needs.
+  const shared = (await import(String('@hermes/shared'))) as {
+    backendScopeKey: typeof backendScopeKey
+    backendScopePrefix: typeof backendScopePrefix
+    LOCAL_CONNECTION_ID: string
+  }
+
+  const cases: [null | string | undefined, null | string | undefined][] = [
+    [null, null],
+    [undefined, undefined],
+    ['', ''],
+    ['local', 'research'],
+    ['homelab', 'research'],
+    ['homelab', ''],
+    ['  homelab  ', '  research  '],
+    ['spark-2', 'default']
+  ]
+
+  for (const [conn, profile] of cases) {
+    assert.equal(backendScopeKey(conn, profile), shared.backendScopeKey(conn, profile))
+  }
+
+  assert.equal(backendScopePrefix('homelab'), shared.backendScopePrefix('homelab'))
+  assert.equal(LOCAL_CONNECTION_ID, shared.LOCAL_CONNECTION_ID)
+})
+
+test('backendScopeKey: local/empty connection keeps the bare profile key', () => {
+  assert.equal(backendScopeKey(null, 'research'), 'research')
+  assert.equal(backendScopeKey('', 'research'), 'research')
+  assert.equal(backendScopeKey(LOCAL_CONNECTION_ID, 'research'), 'research')
+  assert.equal(backendScopeKey('local', ''), 'default')
+  assert.equal(backendScopeKey(undefined, undefined), 'default')
+})
+
+test('backendScopeKey: non-local connections get an unambiguous composite', () => {
+  assert.equal(backendScopeKey('homelab', 'research'), 'conn:homelab::research')
+  assert.equal(backendScopeKey('homelab', ''), 'conn:homelab::default')
+  // Composite keys can never collide with a plain profile name, and the
+  // prefix helper matches exactly the keys the connection owns.
+  assert.ok(backendScopeKey('homelab', 'research').startsWith(backendScopePrefix('homelab')))
+  assert.ok(!backendScopeKey('homelab-2', 'research').startsWith(backendScopePrefix('homelab')))
+  assert.ok(!'research'.startsWith(backendScopePrefix('homelab')))
+})
+
+// --- buildAgentRoster (union roster + @name-device rule) ---
+
+test('roster: unique profiles keep bare handles; duplicates get @name-device', () => {
+  const local = { id: 'local', kind: 'local' as const, label: 'This device' }
+  const homelab = { id: 'homelab', kind: 'remote' as const, label: 'Homelab', url: 'http://h:1' }
+
+  const roster = buildAgentRoster([
+    { connection: local, profiles: ['default', 'research'] },
+    { connection: homelab, profiles: ['research', 'coder'] }
+  ])
+
+  const byKey = new Map(roster.map(a => [`${a.connectionId}/${a.profile}`, a.handle]))
+
+  // research exists on both sources → both disambiguate.
+  assert.equal(byKey.get('local/research'), 'research-this-device')
+  assert.equal(byKey.get('homelab/research'), 'research-homelab')
+  // default and coder are unique → bare names.
+  assert.equal(byKey.get('local/default'), 'default')
+  assert.equal(byKey.get('homelab/coder'), 'coder')
+  assert.equal(roster.length, 4)
+})
+
+test('roster: unreachable sources contribute no rows and cannot fake duplicates', () => {
+  const local = { id: 'local', kind: 'local' as const, label: 'This device' }
+  const dead = { id: 'dead', kind: 'remote' as const, label: 'Dead box', url: 'http://d:1' }
+
+  const roster = buildAgentRoster([
+    { connection: local, profiles: ['research'] },
+    { connection: dead, profiles: null, error: 'unreachable' }
+  ])
+
+  assert.equal(roster.length, 1)
+  // Only one live source has research → bare handle, no phantom duplicate.
+  assert.equal(roster[0].handle, 'research')
+})
+
+// --- updateEligibility ---
+
+test('update fan-out: cloud is platform-managed, everything else eligible', () => {
+  assert.deepEqual(updateEligibility({ id: 'c', kind: 'cloud', label: 'Cloud' }), {
+    eligible: false,
+    reason: 'cloud-managed'
+  })
+  assert.equal(updateEligibility({ id: 'local', kind: 'local', label: 'x' }).eligible, true)
+  assert.equal(updateEligibility({ id: 'r', kind: 'remote', label: 'x' }).eligible, true)
+  assert.equal(updateEligibility({ id: 's', kind: 'ssh', label: 'x' }).eligible, true)
+})
+
 // --- normalizeConnectionInput ---
 
 test('save rejects the reserved "local" id on non-local kinds', () => {
   assert.throws(
-    () => normalizeConnectionInput({ id: 'local', kind: 'remote', label: 'Sneaky', url: 'http://x:1' }, emptyRegistry()),
+    () =>
+      normalizeConnectionInput({ id: 'local', kind: 'remote', label: 'Sneaky', url: 'http://x:1' }, emptyRegistry()),
     /reserved/
   )
 })
@@ -108,7 +213,15 @@ test('token only persists on token-auth remotes; oauth/cloud drop it', () => {
 // --- mergeConnectionInput (edit inheritance) ---
 
 test('merge preserves fields the editor does not carry (org, ssh extras)', () => {
-  const cloud = { authMode: 'oauth' as const, id: 'c', kind: 'cloud' as const, label: 'Cloud', org: 'nous', url: 'https://a.cloud' }
+  const cloud = {
+    authMode: 'oauth' as const,
+    id: 'c',
+    kind: 'cloud' as const,
+    label: 'Cloud',
+    org: 'nous',
+    url: 'https://a.cloud'
+  }
+
   const renamed = mergeConnectionInput({ id: 'c', kind: 'cloud', label: 'Renamed', url: 'https://a.cloud' }, cloud)
 
   assert.equal(renamed.org, 'nous')
@@ -262,8 +375,22 @@ test('normalizeRegistry round-trips a valid registry unchanged in shape', () => 
     primary: 'homelab',
     connections: [
       { id: 'local', kind: 'local', label: 'This device' },
-      { id: 'homelab', kind: 'remote', label: 'Homelab', url: 'http://10.0.0.5:9119', authMode: 'token', token: { v: 1 } },
-      { id: 'cloud-1', kind: 'cloud', label: 'Hermes Cloud', url: 'https://a.hermes.cloud', authMode: 'oauth', org: 'nous' },
+      {
+        id: 'homelab',
+        kind: 'remote',
+        label: 'Homelab',
+        url: 'http://10.0.0.5:9119',
+        authMode: 'token',
+        token: { v: 1 }
+      },
+      {
+        id: 'cloud-1',
+        kind: 'cloud',
+        label: 'Hermes Cloud',
+        url: 'https://a.hermes.cloud',
+        authMode: 'oauth',
+        org: 'nous'
+      },
       { id: 'spark', kind: 'ssh', label: 'Spark', host: 'spark1', user: 'tek', port: 2222 }
     ]
   }
@@ -272,7 +399,10 @@ test('normalizeRegistry round-trips a valid registry unchanged in shape', () => 
 
   assert.equal(registry.primary, 'homelab')
   assert.equal(registry.connections.length, 4)
-  assert.deepEqual(registry.connections.map(c => c.id), ['local', 'homelab', 'cloud-1', 'spark'])
+  assert.deepEqual(
+    registry.connections.map(c => c.id),
+    ['local', 'homelab', 'cloud-1', 'spark']
+  )
   assert.deepEqual(registry.connections[1].token, { v: 1 })
   assert.equal(registry.connections[3].port, 2222)
 })
