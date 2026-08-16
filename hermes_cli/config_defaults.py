@@ -1140,6 +1140,9 @@ DEFAULT_CONFIG = {
         # replay; different model = digest. Quality holds (memory capture
         # identical, skill near-identical in benchmarks).
         "background_review": {
+            # Master switch for automatic post-turn memory/skill review forks.
+            # false = skip automatic spawns (manual /refine still works).
+            "enabled": True,
             "provider": "auto",
             "model": "",
             "base_url": "",
