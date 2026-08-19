@@ -1,10 +1,17 @@
 name: Sync upstream (Hermes Agent)
 
-# Keeps `main` as a pristine mirror of NousResearch/Hermes-Agent@main, then
-# merges those changes up into the `color-hermes` overlay branch (which carries
-# this fork's own commits, including this workflow). If the overlay merge
-# conflicts, the run opens a single tracking issue instead of force-pushing.
-# Pattern copied from color-llm's sync-upstream.yml.
+# Keeps `upstream-main` as a pristine mirror of NousResearch/Hermes-Agent@main,
+# then merges those changes up into the `color-hermes` overlay branch (which
+# carries this fork's own commits, including this workflow). If the overlay
+# merge conflicts, the run opens a single tracking issue instead of
+# force-pushing. Pattern copied from color-llm's sync-upstream.yml.
+#
+# Why `upstream-main` and not `main`: upstream's workflows (ci.yml, docker.yml,
+# js-autofix.yml, …) all trigger on `push: branches: [main]`. Mirroring into
+# `main` burned a full CI + Docker matrix on every sync push (issue #1) and let
+# js-autofix open auto-merge PRs that would dirty the mirror. Pushing the
+# mirror to `upstream-main` matches none of those triggers, so sync pushes run
+# zero workflows. `main` is left frozen; the branch of record is `color-hermes`.
 
 on:
   schedule:
@@ -43,18 +50,19 @@ jobs:
             || git remote set-url upstream "$UPSTREAM_URL"
           git fetch upstream main --no-tags
 
-      - name: Fast-forward main to upstream/main
+      - name: Mirror upstream/main into upstream-main
+        # A plain (non-force) push is fast-forward-only by definition, so this
+        # keeps the same "fail loudly if upstream rewrote history" behavior the
+        # old `merge --ff-only` step had. Creates the branch on first run.
         run: |
-          git checkout -B main origin/main
-          git merge --ff-only upstream/main
-          git push origin main
+          git push origin upstream/main:refs/heads/upstream-main
 
-      - name: Merge main into color-hermes overlay
+      - name: Merge upstream into color-hermes overlay
         id: overlay
         run: |
           git checkout -B color-hermes origin/color-hermes
           set +e
-          git merge --no-edit main
+          git merge --no-edit upstream/main
           code=$?
           set -e
           if [ "$code" -ne 0 ]; then
@@ -85,16 +93,16 @@ jobs:
               title: 'Upstream sync: merge conflict into `color-hermes` overlay',
               labels: [label],
               body: [
-                'The scheduled upstream sync updated `main` to the latest Hermes Agent,',
-                'but merging `main` into the `color-hermes` overlay branch hit conflicts.',
-                '`main` is up to date; the overlay was left untouched.',
+                'The scheduled upstream sync updated `upstream-main` to the latest Hermes Agent,',
+                'but merging it into the `color-hermes` overlay branch hit conflicts.',
+                '`upstream-main` is up to date; the overlay was left untouched.',
                 '',
                 'Resolve manually:',
                 '',
                 '```bash',
                 'git fetch origin',
                 'git checkout color-hermes',
-                'git merge main',
+                'git merge origin/upstream-main',
                 '# resolve conflicts, then:',
                 'git push origin color-hermes',
                 '```',
