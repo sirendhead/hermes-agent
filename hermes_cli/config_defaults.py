@@ -821,6 +821,10 @@ DEFAULT_CONFIG = {
     "tool_loop_guardrails": {
         "warnings_enabled": True,
         "hard_stop_enabled": False,
+        # Unattended gateway/cron platforms get hard stops by default (nobody
+        # is present to /stop a model that ignores loop warnings); interactive
+        # cli/tui/desktop/acp stay warning-only unless hard_stop_enabled.
+        "non_interactive_hard_stop_enabled": True,
         "warn_after": {
             "exact_failure": 2,
             "same_tool_failure": 3,
@@ -957,6 +961,10 @@ DEFAULT_CONFIG = {
                                       # waiting. Kept well under chat-transport idle timeouts
                                       # (Telegram ~30s). On expiry the turn proceeds
                                       # uncompressed — an availability boundary, not a failure.
+                                      # The detached worker keeps its commit admission when its
+                                      # commit is watermark-fenced, so the finished summary is
+                                      # adopted at the next safe boundary instead of being
+                                      # discarded (#97963 — thinking summary models).
         "context_timeout_seconds": 120,  # inactivity budget for in-agent compress_context
                                       # (conversation loop, /compress, preflight, etc.).
                                       # Same progress-aware semantics as hygiene_timeout_seconds:
@@ -2806,6 +2814,15 @@ DEFAULT_CONFIG = {
         # Wrap delivered cron responses with a header (task name) and footer
         # ("The agent cannot see this message").  Set to false for clean output.
         "wrap_response": True,
+        # Delivery behaviour for cron output sent through a live gateway adapter.
+        "delivery": {
+            # Mark cron deliveries as FINAL notifications so the platform pushes
+            # them (Telegram's "important" notification mode otherwise sends
+            # every non-notify message with disable_notification=True, and users
+            # report the silent brief as "never delivered"). Set to false to
+            # restore silent (no-push) cron deliveries.
+            "notify": True,
+        },
         # Make cron deliveries CONTINUABLE: a user can reply to a cron brief
         # and the agent has it in context (no "what is Task #2?" amnesia).
         # Default False preserves the historical isolation guarantee (cron
@@ -3346,6 +3363,17 @@ DEFAULT_CONFIG = {
         # (gateway/platforms/base.py), so the cap holds across every platform
         # adapter. ``0`` disables the cap. Default 128 MiB.
         "max_inbound_media_bytes": 134217728,
+
+        # Whether gateway platform adapters let aiohttp read proxy settings
+        # (HTTP_PROXY / HTTPS_PROXY / NO_PROXY, plus SSL_CERT_FILE) from the
+        # process environment, and whether generic proxy env / the macOS
+        # system proxy are auto-detected for adapter clients. Set to false
+        # when the gateway inherits a proxy it must not use — e.g. a Windows
+        # Scheduled Task picking up a Clash/V2Ray HTTP_PROXY the interactive
+        # shell never sees, producing "Cannot connect to host 127.0.0.1:7890"
+        # poll loops (#48820). Explicit per-platform vars (DISCORD_PROXY,
+        # TELEGRAM_PROXY, ...) are still honored. One knob for every adapter.
+        "trust_env": True,
 
         # When false (default), any file path the agent emits is delivered
         # as a native attachment as long as it isn't under the credential /
