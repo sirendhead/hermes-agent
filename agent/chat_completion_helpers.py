@@ -1317,10 +1317,12 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
             tools_for_api, _ = strip_slash_enum(tools_for_api)
         except Exception as exc:
             logger.warning("%s⚠️ Failed to sanitize tool schemas for xAI: %s", getattr(agent, "log_prefix", ""), exc)
+    ephemeral_out = _consume_ephemeral_max_output(agent)
     return agent._get_transport().build_kwargs(model=agent.model,
         messages=agent._prepare_messages_for_non_vision_model(api_messages), tools=tools_for_api,
         reasoning_config=reasoning_config, session_id=getattr(agent, "session_id", None),
-        cache_scope_id=cache_scope_id, base_url=agent.base_url, max_tokens=agent.max_tokens,
+        cache_scope_id=cache_scope_id, base_url=agent.base_url,
+        max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
         provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
         is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
@@ -1709,6 +1711,14 @@ def _fallback_api_mode_resolved(agent, fb_provider: str, fb_model: str, fb_base_
     landed on the chat_completions default (never called for an explicit api_mode)."""
     if fb_provider == "openai-codex":
         return "codex_responses"
+    from hermes_cli.models import opencode_model_api_mode
+    from hermes_cli.runtime_provider_custom import _opencode_family_for_custom
+    opencode_family = _opencode_family_for_custom(fb_provider, fb_base_url)
+    if opencode_family is not None:
+        # OpenCode Zen/Go/free serve Responses-only (muse-spark, gpt-*, grok-*), anthropic_messages
+        # (minimax, qwen) and chat_completions models behind one provider; the primary /model path
+        # already re-derives per model — the fallback wire must agree (#102148).
+        return opencode_model_api_mode(opencode_family, fb_model)
     if fb_provider in {"nous", "nous-portal", "nousresearch"}:
         # Portal is dual-wire: anthropic/* must land on /v1/messages (the swap rebuilds the native client).
         from hermes_cli.providers import nous_api_mode
@@ -1902,18 +1912,28 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
                 continue
-            try:
-                from hermes_cli.model_normalize import normalize_model_for_provider
-                fb_model = normalize_model_for_provider(fb_model, fb_provider)
-            except Exception as _norm_err:
-                logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
+            if fb_provider == "moa":
+                # A MoA entry means the preset itself, exactly like ``provider: moa`` in config or
+                # ``/model <preset> --provider moa``. The chokepoint's client is the preset's
+                # aggregator: it only proves the preset resolves and the aggregator has credentials.
+                # Installing it as the acting client with the virtual identity is a hybrid nobody
+                # handles (#112525: preset name sent as model id → 404; #112623: every
+                # ``provider == "moa"`` guard and key misfires and the next rebuild swaps in the
+                # facade anyway). Bind the facade with the same pins every other MoA build site uses.
+                fb_base_url, fb_api_mode = "moa://local", "chat_completions"
+            else:
+                try:
+                    from hermes_cli.model_normalize import normalize_model_for_provider
+                    fb_model = normalize_model_for_provider(fb_model, fb_provider)
+                except Exception as _norm_err:
+                    logger.warning("Could not normalize fallback model %r for provider %r: %s", fb_model, fb_provider, _norm_err)
 
-            fb_base_url = str(fb_client.base_url)
-            from hermes_cli.providers import is_actual_route
-            if is_actual_route(fb_provider, fb_base_url):
-                fb_api_mode = "chat_completions"
-            elif not fb_api_mode_explicit and fb_api_mode == "chat_completions":
-                fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
+                fb_base_url = str(fb_client.base_url)
+                from hermes_cli.providers import is_actual_route
+                if is_actual_route(fb_provider, fb_base_url):
+                    fb_api_mode = "chat_completions"
+                elif not fb_api_mode_explicit and fb_api_mode == "chat_completions":
+                    fb_api_mode = _fallback_api_mode_resolved(agent, fb_provider, fb_model, fb_base_url)
 
             old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
 
@@ -1930,8 +1950,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._fallback_activated = True
 
             _rebind_fallback_credential_pool(agent, fb_provider, fb_model)
-            from agent.client_lifecycle import _swap_fallback_clients
-            _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
+            if fb_provider == "moa":
+                from agent.moa_loop import bind_moa_runtime
+                bind_moa_runtime(agent, fb_model)
+            else:
+                from agent.client_lifecycle import _swap_fallback_clients
+                _swap_fallback_clients(agent, fb_client, fb_provider, fb_model, fb_base_url, fb_api_mode)
 
             from agent.agent_runtime_helpers import sync_credential_pool_entry_id
             sync_credential_pool_entry_id(agent)
@@ -2646,6 +2670,12 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._fire_stream_delta(text)
         self.deltas_were_sent["yes"] = True
 
+    def _visible_text_delivered(self) -> bool:
+        """True when visible assistant text actually reached a stream consumer this attempt
+        (``_fire_stream_delta`` records only scrubbed, delivered text; ``deltas_were_sent``
+        flips on any content delta, including whitespace/think-only ones nobody saw)."""
+        return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
+
     def _emit_reasoning(self, text: str) -> None:
         self._fire_first_delta()
         self.agent._fire_reasoning_delta(text)
@@ -3207,11 +3237,26 @@ class _StreamingCall(StreamingWaitMonitor):
             return True
 
         if self.deltas_were_sent["yes"]:
+            _partial_tool_in_flight = bool(self.result.get("partial_tool_names")) or self.provider_tool_in_flight["yes"]
+            if not _partial_tool_in_flight and not self._visible_text_delivered():
+                # Deltas fired but nothing visible reached a consumer (whitespace/think-only
+                # deltas, or no display consumer at all) and no tool call is in flight: from
+                # the user's and the model's point of view NOTHING was delivered. The
+                # "partial delivery" stub would be EMPTY and the loop would ask the model to
+                # continue from nowhere, so it repeats the lost step (#112419). Classify as an
+                # undelivered failure instead: same-prefix retry, then the main loop's
+                # fallback/backoff — there is no text to duplicate.
+                logger.warning(
+                    "Stream died after deltas but before any visible text was delivered (0 chars, "
+                    "no tool call in flight); treating as an undelivered stream failure: %s", e)
+                self._quiet(self.agent._reset_stream_delivery_tracking)
+                self.deltas_were_sent["yes"] = False
+                self.first_delta_fired["done"] = False
+        if self.deltas_were_sent["yes"]:
             # Died AFTER tokens were delivered: normally no retry (would duplicate
             # text). Exception: a tool call in flight — aborting discards it, so
             # retry TRANSIENT errors (a "reconnecting" marker + duplicated
             # preamble beats a failed action; no tool has executed yet).
-            _partial_tool_in_flight = bool(self.result.get("partial_tool_names")) or self.provider_tool_in_flight["yes"]
             if not (_partial_tool_in_flight and _is_transient and attempt < max_retries):
                 logger.warning("Streaming failed after partial delivery, not retrying: %s", e)
                 self.result["error"] = e
@@ -3410,8 +3455,10 @@ class _StreamingCall(StreamingWaitMonitor):
     def _partial_stream_stub(self):
         """Tokens already reached the platform: a finish_reason="length" stub fires the
         continuation machinery; tool_calls=None blocks executing incomplete calls.
-        Content may be EMPTY on purpose — the loop skips appending an empty stub and
-        only sends the nudge (placeholder text leaked into the stitched response)."""
+        Content may be EMPTY (dropped tool call, overflow) — the loop skips appending an
+        empty stub and only sends the nudge (placeholder text leaked into the stitched
+        response). A text-only death with 0 visible chars never gets here: the error
+        handler reclassifies it as undelivered (#112419)."""
         error = self.result["error"]
         _partial_text = (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip() or None
         _partial_names = list(self.result.get("partial_tool_names") or [])

@@ -17,6 +17,7 @@ from agent.prompt_builder import (
     _skill_should_show,
     _find_hermes_md,
     _find_git_root,
+    _cursorrules_candidates,
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
     build_context_files_prompt,
@@ -628,7 +629,19 @@ class TestFindHermesMd:
         with patch("agent.prompt_builder._find_git_root", return_value=None):
             assert _find_hermes_md(cwd) is None
 
-
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+    def test_unreadable_cwd_is_treated_as_not_found(self, tmp_path):
+        """A cwd the process cannot stat yields "no context file" instead of a PermissionError
+        escaping prompt construction and taking down every surface sharing the gateway (#112430:
+        TERMINAL_CWD pointed at an SSH backend's remote ``/root`` while the local user was non-root)."""
+        locked = tmp_path / "root"
+        locked.mkdir()
+        locked.chmod(0)
+        try:
+            assert _find_hermes_md(locked) is None
+            assert isinstance(build_context_files_prompt(cwd=str(locked)), str)
+        finally:
+            locked.chmod(0o700)
 
 
 class TestFindGitRoot:
@@ -655,6 +668,24 @@ class TestFindGitRoot:
         # If result is not None, it must actually contain .git
         if result is not None:
             assert (result / ".git").exists()
+
+
+class TestCursorrulesCandidates:
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+    def test_unreadable_cwd_is_treated_as_absent(self, tmp_path):
+        """Same crash shape as ``_find_hermes_md``: ``.is_dir()`` on ``<cwd>/.cursor/rules`` inside an
+        unreadable cwd must not raise; a readable sibling project still yields its rules."""
+        locked = tmp_path / "root"
+        locked.mkdir()
+        proj = tmp_path / "proj"
+        (proj / ".cursor" / "rules").mkdir(parents=True)
+        (proj / ".cursor" / "rules" / "a.mdc").write_text("cursor rule")
+        locked.chmod(0)
+        try:
+            assert _cursorrules_candidates(locked) == []
+        finally:
+            locked.chmod(0o700)
+        assert [label for label, _p, _c in _cursorrules_candidates(proj)] == [".cursor/rules/a.mdc"]
 
 
 class TestStripYamlFrontmatter:
