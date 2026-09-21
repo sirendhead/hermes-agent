@@ -492,7 +492,9 @@ describe('per-member delta', () => {
     const thread = room.rounds.sendToGroupChat('Trim', members, 'delivered')!
     await drain(() => room.gateway.calls.length < 1)
 
-    for (let i = 0; i < 100; i++) {
+    const retained = room.chat.GROUP_CHAT_LOG_RETAIN
+
+    for (let i = 0; i < retained; i++) {
       room.chat.appendGroupChatEntry('Trim', { kind: 'user', name: 'You' }, `unseen-${i}`, thread)
     }
 
@@ -500,52 +502,81 @@ describe('per-member delta', () => {
     await settle(room, 'Trim')
     expect(room.chat.$groupChats.get().Trim.watermarks[`${thread}::research`]).toBe(0)
     await room.rounds.runGroupChatRounds('Trim', members, thread)
-    expect(room.gateway.calls.at(-1)?.prompt).toContain('unseen-99')
+    expect(room.gateway.calls.at(-1)?.prompt).toContain(`unseen-${retained - 1}`)
   })
 
-  // #114341: the turn renders only the last GROUP_CHAT_HISTORY_LIMIT entries
-  // of the delta while the watermark advances past the whole tail, so the
+  // #114341 follow-up: the turn renders the newest delta lines that fit the
+  // window (GROUP_CHAT_HISTORY_LIMIT entries / GROUP_CHAT_HISTORY_CHARS
+  // characters) while the watermark advances past the whole tail, so the
   // head is never delivered later either. The cut must be visible to the
-  // member (naming how many entries it did not see); a delta that fits
-  // carries no marker.
-  it('names the omitted head of an over-long delta in the turn prompt', async () => {
+  // member and name EXACTLY how many entries it did not see; a delta that
+  // fits carries no marker.
+  it('names the exact omitted head of an over-budget delta and keeps the newest', async () => {
     const room = await loadRoom({ turn: () => '(pass)' })
     const members = [MEMBERS[0]]
     const thread = room.rounds.sendToGroupChat('Head', members, 'seen-0')!
     await settle(room, 'Head')
-    const limit = room.chat.GROUP_CHAT_HISTORY_LIMIT
+    const total = 40
+    const body = 'x'.repeat(1000)
 
-    for (let i = 1; i <= limit + 5; i++) {
-      room.chat.appendGroupChatEntry('Head', { kind: 'user', name: 'You' }, `unseen-${i}`, thread)
+    for (let i = 1; i <= total; i++) {
+      room.chat.appendGroupChatEntry('Head', { kind: 'user', name: 'You' }, `unseen-${i} ${body}`, thread)
     }
 
-    const seen = room.chat.$groupChats.get().Head.watermarks[`${thread}::research`] || 0
-    const omitted = log(room, 'Head').slice(seen).length - limit
-    expect(omitted).toBeGreaterThan(0)
+    expect(total * body.length).toBeGreaterThan(room.chat.GROUP_CHAT_HISTORY_CHARS)
 
     await room.rounds.runGroupChatRounds('Head', members, thread)
     const prompt = room.gateway.calls.at(-1)?.prompt || ''
+    const rendered = prompt.match(/unseen-\d+ /g) || []
+    const omitted = Number(prompt.match(/… (\d+) earlier room messages omitted since your last turn/)?.[1])
 
-    expect(prompt).toMatch(new RegExp(`${omitted} earlier room messages omitted`))
-    expect(prompt).toContain(`unseen-${limit + 5}`)
-    expect(prompt).not.toContain(`unseen-${omitted}\n`)
+    expect(omitted).toBeGreaterThan(0)
+    expect(omitted + rendered.length).toBe(total)
+    expect(prompt).toContain(`unseen-${total} `)
+    expect(prompt).not.toContain('unseen-1 ')
+    expect(prompt).not.toContain('[truncated]')
   })
 
-  it('adds no omission marker when the delta fits the window', async () => {
+  it('does not cut a 150-entry delta that fits the window', async () => {
     const room = await loadRoom({ turn: () => '(pass)' })
     const members = [MEMBERS[0]]
     const thread = room.rounds.sendToGroupChat('Fits', members, 'seen-0')!
     await settle(room, 'Fits')
 
-    for (let i = 1; i < room.chat.GROUP_CHAT_HISTORY_LIMIT; i++) {
-      room.chat.appendGroupChatEntry('Fits', { kind: 'user', name: 'You' }, `unseen-${i}`, thread)
+    for (let i = 1; i <= 150; i++) {
+      room.chat.appendGroupChatEntry('Fits', { kind: 'user', name: 'You' }, `unseen-${i} short room line`, thread)
     }
 
     await room.rounds.runGroupChatRounds('Fits', members, thread)
     const prompt = room.gateway.calls.at(-1)?.prompt || ''
 
-    expect(prompt).toContain('unseen-1')
+    expect(prompt).toContain('unseen-1 short')
+    expect(prompt).toContain('unseen-150 short')
     expect(prompt).not.toMatch(/omitted/)
+  })
+
+  // One giant paste is cut to the per-line budget instead of evicting the
+  // ordinary messages around it.
+  it('truncates one oversized body rather than dropping its neighbours', async () => {
+    const room = await loadRoom({ turn: () => '(pass)' })
+    const members = [MEMBERS[0]]
+    const thread = room.rounds.sendToGroupChat('Paste', members, 'seen-0')!
+    await settle(room, 'Paste')
+
+    room.chat.appendGroupChatEntry('Paste', { kind: 'user', name: 'You' }, 'before the paste', thread)
+    room.chat.appendGroupChatEntry('Paste', { kind: 'user', name: 'You' }, `PASTE-${'y'.repeat(60_000)}-END`, thread)
+    room.chat.appendGroupChatEntry('Paste', { kind: 'user', name: 'You' }, 'after the paste', thread)
+
+    await room.rounds.runGroupChatRounds('Paste', members, thread)
+    const prompt = room.gateway.calls.at(-1)?.prompt || ''
+
+    expect(prompt).toContain('before the paste')
+    expect(prompt).toContain('after the paste')
+    expect(prompt).toContain('PASTE-yyy')
+    expect(prompt).toContain('… [truncated]')
+    expect(prompt).not.toContain('-END')
+    expect(prompt).not.toMatch(/omitted/)
+    expect(prompt.length).toBeLessThan(room.chat.GROUP_CHAT_HISTORY_LINE_CHARS + 2000)
   })
 
   it('feeds a second send only the NEW messages', async () => {
@@ -1059,6 +1090,45 @@ describe('member holds (#93129)', () => {
     expect([...rounds.classifyGroupHoldDirective('@impl please halt', ['conn::impl'], false).hold]).toEqual(['conn::impl'])
   })
 
+  // #117040: proximity is measured on what the user directs at the room, not
+  // on content they quote or paste. A stop word inside a fenced block, inline
+  // code span, quoted span (straight or typographic) or blockquote line is content — reporting
+  // or debugging a hold must not re-hold the addressed member.
+  it('holds nobody when the stop word sits inside quoted or pasted content', async () => {
+    const { rounds } = await loadRoom()
+
+    for (const text of [
+      '```text\nstop @impl\n```',
+      'The log printed `@impl pause` here',
+      'Why did "pause @impl" hold the bot?',
+      'Why did “pause @impl” hold the bot?',
+      // A cut-short paste leaves the fence unclosed; the rest is still content.
+      'look what the docs say:\n```js\nstop @impl\n',
+      '> stop @impl'
+    ]) {
+      const action = rounds.classifyGroupHoldDirective(text, ['impl'], false)
+
+      expect([...action.hold]).toEqual([])
+      // The mention itself still reaches the member: quoting AT the bot is a
+      // direct address, which releases a held member like any other mention.
+      expect([...action.release]).toEqual(['impl'])
+    }
+  })
+
+  it('still holds on the plain directive forms once masking is active', async () => {
+    const { rounds } = await loadRoom()
+
+    for (const text of ['stop @impl', '@impl stop', '@impl please halt', '@all stop']) {
+      const action = rounds.classifyGroupHoldDirective(text, ['impl'], text.startsWith('@all'))
+
+      expect([...action.hold]).toEqual(['impl'])
+    }
+
+    // A masked span collapses to one word, so a genuine directive with pasted
+    // content between the stop word and the mention keeps its proximity.
+    expect([...rounds.classifyGroupHoldDirective('stop `service` @impl', ['impl'], false).hold]).toEqual(['impl'])
+  })
+
   // A genuine stop whose stop word sits 3+ tokens from the mention may miss the
   // hold, but it must never RELEASE (re-dispatch) the member it tells to stop.
   it('never releases the addressed member on a distant genuine stop', async () => {
@@ -1170,6 +1240,37 @@ describe('member holds (#93129)', () => {
     expect(heldMemberWatermarkAdvance(9, 7)).toBeNull()
     // Unset watermark treated as 0.
     expect(heldMemberWatermarkAdvance(undefined, 2)).toBe(2)
+  })
+
+  it('replays messages consumed by a hold into the released member next turn', async () => {
+    const room = await loadRoom()
+    const member = [{ name: 'research', title: '' }]
+
+    room.rounds.sendToGroupChat('Held', member, 'stop @research — remember TRIGGER_TEXT')
+    await settle(room, 'Held')
+    expect(room.gateway.calls).toHaveLength(0)
+    expect(room.chat.$groupChats.get().Held.heldMessages?.research).toHaveLength(1)
+
+    room.rounds.sendToGroupChat('Held', member, '@research resume with the context')
+    await settle(room, 'Held')
+
+    expect(room.gateway.calls[0].prompt).toMatch(/TRIGGER_TEXT[\s\S]*resume with the context/)
+    expect(room.chat.$groupChats.get().Held.heldMessages?.research).toBeUndefined()
+  })
+
+  it('lets a room disable text hold detection without weakening the Stop action', async () => {
+    const room = await loadRoom()
+    const member = [{ name: 'research', title: '' }]
+    room.chat.updateGroupChat('No holds', state => ({ ...state, holdDetection: false }))
+
+    room.rounds.sendToGroupChat('No holds', member, 'stop @research but answer this')
+    await settle(room, 'No holds')
+
+    expect(room.gateway.calls).toHaveLength(1)
+    expect(room.chat.$groupChats.get()['No holds'].holds).toEqual({})
+    await room.rounds.stopGroupThread('No holds', null, member)
+    expect(room.chat.$groupChats.get()['No holds'].holds).toEqual({})
+    expect(room.chat.$groupChats.get()['No holds'].running).toBe(false)
   })
 })
 
@@ -1317,6 +1418,27 @@ describe('stopGroupThread (#91868/#94569)', () => {
     // The poll loop exited promptly after the stop, not at the deadline.
     expect(room.gateway.rpcFor('session.resume').length).toBeLessThanOrEqual(6)
     expect(room.chat.$groupChats.get().Room.running).toBe(false)
+  })
+
+  it('cancels an in-flight completion after Stop when sticky holds are disabled', async () => {
+    let finish!: (reply: string) => void
+    const pendingReply = new Promise<string>(resolve => {
+      finish = resolve
+    })
+    const room = await loadRoom({ turn: () => pendingReply })
+    const member = [{ name: 'helper', title: '' }]
+
+    room.chat.updateGroupChat('Room', state => ({ ...state, holdDetection: false }))
+    room.rounds.sendToGroupChat('Room', member, 'long task')
+    await drain(() => room.gateway.calls.length < 1)
+
+    await room.rounds.stopGroupThread('Room', null, member)
+    finish('must not be committed')
+    await drain(() => room.gateway.refcount() > 0)
+
+    const state = room.chat.$groupChats.get().Room
+    expect(state.holds).toEqual({})
+    expect(state.log.filter(entry => entry.from.kind === 'member')).toHaveLength(0)
   })
 
   it('keeps polling through an ordinary newer-send epoch bump so late work still lands', async () => {

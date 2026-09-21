@@ -68,11 +68,7 @@ export interface Translations {
     grant: string
     connected: string
     checking: string
-    waitingSignIn: string
     notConnected: string
-    notAvailable: string
-    startWith: (count: number) => string
-    startWithout: string
     skipped: string
     disabled: string
     failed: string
@@ -81,7 +77,6 @@ export interface Translations {
     waiting: string
     timeout: string
     refresh: string
-    statusError: string
     connectError: string
     connectErrorFor: (app: string) => string
     unavailable: string
@@ -90,6 +85,11 @@ export interface Translations {
     empty: string
     disclaimer: string
     execution: string
+    setup: (server: string) => string
+    openInBrowser: string
+    setupCancel: string
+    authorizedToolsUnavailable: string
+    required: string
   }
   sessionImport: {
     title: string
@@ -185,6 +185,7 @@ export interface Translations {
     deleteBody: string
     pathCopied: string
     revealMissing: string
+    revealUnavailable: string
   }
 
   boot: {
@@ -1589,6 +1590,10 @@ export interface Translations {
       updateToPin: (sha: string) => string
       updateFailed: (name: string) => string
       updated: (name: string) => string
+      deepLinkErrorTitle: string
+      deepLinkCatalogInvalidName: string
+      deepLinkCatalogUnknown: (name: string) => string
+      deepLinkCatalogUnavailable: string
     }
     officialCatalog: string
     officialPill: string
@@ -3652,7 +3657,6 @@ export interface Translations {
       authorized: (server: string) => string
       failed: (server: string) => string
       toolCount: (count: number) => string
-      notInCatalog: (server: string) => string
       envRequired: string
       sendFailed: string
       reloadFailed: string
@@ -3695,6 +3699,7 @@ export interface Translations {
       statusDone: string
       /** Over-budget / rejected memory write title — not "Saved to memory". */
       resultUnavailable: string
+      resultInterrupted: string
       memoryWriteNoted: string
       actions: {
         read: string
