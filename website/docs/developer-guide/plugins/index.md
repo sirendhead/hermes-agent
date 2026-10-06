@@ -676,8 +676,9 @@ Config and state have different owners: settings are user-visible behavior in
 
 ### Settings form in the Desktop
 
-Every key you declare in the manifest's `config_schema` renders as a field in the
-Desktop app's **Capabilities → Plugins** tab (the gear on the plugin's row). No
+Every key you declare in the manifest's `config_schema` renders as a row on the
+plugin's own page under the Desktop app's **Settings → Plugins** (the gear on the
+plugin's Capabilities → Plugins row opens it). No
 Desktop code is needed: the backend's `plugins.manage list` returns the schema
 plus each key's current value, and saving writes through the same writer as
 `ctx.set_config()`, so `plugins.entries.<id>.settings.<key>` is what your plugin
@@ -691,8 +692,9 @@ reads back. The form is table-driven by `type`:
 | `list`, `dict` | JSON editor | |
 | `secret` | masked input | `env: MY_PLUGIN_TOKEN` — the `.env` variable it is stored under (default `<PLUGIN_ID>_<KEY>` upper-snaked) |
 
-Every entry also accepts `label` (shown instead of the key), `description`
-(help text under the field), `default` and `required`.
+Every entry also accepts `label` (or `title`; without one the key is shown in
+sentence case, `maps_api_key` → "Maps API key"), `description` (help text under
+the label), `default` and `required` (marks the row **Required**).
 
 ```yaml
 config_schema:
@@ -1462,6 +1464,18 @@ def register(ctx):
 ```
 
 For running a full `hermes <subcommand>` (e.g. `hermes kanban show`), shell out with the `terminal` tool via `ctx.dispatch_tool("terminal", {"command": "hermes kanban show ..."})` — there is no in-process slash-command bridge for headless worker sessions, and tools are the supported way to drive Hermes from a hook.
+
+### Send raw CDP commands to the agent's browser
+
+A plugin that must drive the agent's browser below the browser tools can get a
+CDP handle pinned to a task's live supervisor connection with
+`SUPERVISOR_REGISTRY.capture(task_id)` and send commands with
+`call(method, params=None, *, session_id=None, timeout=10.0)`. The handle
+raises `CapturedCDPInvalid` once that connection is gone and never retargets a
+newer one. Use it instead of reading or writing `CDPSupervisor` private
+attributes, which the catalog rejects. It is trusted in-process transport only:
+it performs no origin, consent or ownership checks for you. Full contract:
+[Browser CDP Supervisor](../browser-supervisor.md#trusted-plugin-cdp-access).
 
 ### Know which cron run you are in
 
