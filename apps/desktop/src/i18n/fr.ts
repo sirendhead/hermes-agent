@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale, type TranslationOverrides } from './define-locale'
+import { frAuxTasks } from './fr_aux_tasks'
 import { frModelMenu } from './fr_model_menu'
 import { introFr } from './intro-fr'
 
@@ -11,7 +12,7 @@ export const frOverrides = {
       'Les métriques partagées ne contiennent que des compteurs bornés. Jamais de prompts, fichiers, chemins ni textes d’erreur. La collecte reste locale. Les envoyer à Nous est un consentement distinct.',
     whatIsCollected: 'Ce qui est collecté',
     collectedIntro: 'Uniquement des compteurs bornés :',
-    collectedActivity: 'Activité, durée des sessions, résultats et classes d’erreur',
+    collectedActivity: 'Activité, durée des sessions, résultats et classes d’erreur, y compris un motif issu d’une liste fixe quand une écriture en mémoire ou une compression du contexte est refusée, échoue ou est ignorée',
     collectedModels: 'Routes de modèles et totaux de tokens',
     collectedNames: 'Noms des outils, commandes et éléments du catalogue intégrés',
     collectedMilestones: 'Comptes de configuration regroupés',
@@ -2131,6 +2132,8 @@ export const frOverrides = {
       change: 'Modifier',
       autoUseMain: 'auto · utiliser le modèle principal',
       inheritMainEffort: 'hériter · effort du modèle principal',
+      inheritsFrom: task => `hérite de ${task}`,
+      followTask: task => `Suivre ${task}`,
       providerDefault: '(par défaut du fournisseur)',
       fallbackAdd: 'Ajouter un secours',
       fallbackEmpty: "Aucun modèle de secours — le modèle par défaut est utilisé sauf en cas d'échec.",
@@ -2143,52 +2146,7 @@ export const frOverrides = {
       moaAggregator: 'Agrégateur',
       moaAggregatorBilled: "modèle actif · facturé pour l'exécution",
       moaReferenceHint: 'donne un avis une fois par tour par défaut',
-      tasks: {
-        vision: {
-          label: 'Vision',
-          hint: "Analyse d'image"
-        },
-        compression: {
-          label: 'Compression',
-          hint: 'Compaction de contexte'
-        },
-        skills_hub: {
-          label: 'Hub de skills',
-          hint: 'Recherche de skills'
-        },
-        approval: {
-          label: 'Approbation',
-          hint: 'Auto-approbation intelligente'
-        },
-        mcp: {
-          label: 'MCP',
-          hint: "Routage d'outils MCP"
-        },
-        title_generation: {
-          label: 'Génération de titre',
-          hint: 'Titres de session'
-        },
-        review: {
-          label: 'Révision',
-          hint: 'Sous-agent de révision /review'
-        },
-        triage_specifier: {
-          label: 'Précision du triage',
-          hint: 'Détail des spécifications Kanban'
-        },
-        kanban_decomposer: {
-          label: 'Décomposition Kanban',
-          hint: 'Décomposition des tâches'
-        },
-        profile_describer: {
-          label: 'Description de profil',
-          hint: 'Descriptions automatiques des profils'
-        },
-        curator: {
-          label: 'Curateur',
-          hint: "Revue d'utilisation des skills"
-        }
-      }
+      tasks: frAuxTasks
     },
     localModels: {
       connectionChanged: 'La connexion des modèles locaux a changé',
