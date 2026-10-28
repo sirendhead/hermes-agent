@@ -5154,9 +5154,8 @@ def main():
 
     config = None
     if args.config:
-        import hermes_yaml as yaml
-        with open(args.config, encoding="utf-8-sig") as f:
-            config = GatewayConfig.from_dict(yaml.safe_load(f) or {})
+        from gateway.config_loader import load_gateway_config_file
+        config = load_gateway_config_file(args.config)
         # Same boot-time verdict the loaded config gets when the file leaves the flag unset.
         from hermes_cli.gateway_multiplex_mode import log_multiplex_decision, resolve_multiplex_mode
         log_multiplex_decision(resolve_multiplex_mode(config))
