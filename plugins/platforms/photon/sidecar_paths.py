@@ -11,6 +11,7 @@ Resolution never happens at import time (it probes/copies on disk).
 from __future__ import annotations
 
 import filecmp
+import json
 import logging
 import os
 import shutil
@@ -29,6 +30,8 @@ _MIRROR_FILES = (
     "package.json",
     "package-lock.json",
     "patch-spectrum-mixed-attachments.mjs",
+    "send-format.mjs",
+    "stream-staleness.mjs",
     ".npmrc",
 )
 # Tests monkeypatch these module globals directly; the accessors honor a non-None value.
@@ -39,13 +42,40 @@ _NPM_ERROR_LOG: Optional[Path] = None
 _NPM_ERROR_LOG_MAX_CHARS = 300
 
 
+def _is_in_sealed_bundle(path: Path) -> bool:
+    """True when ``path`` sits under a bundled desktop payload (``install-stamp.json``
+    with ``payload == "bundled"``), which is user-writable on macOS yet sealed."""
+    resolved = path.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return False
+        stamp = candidate / "install-stamp.json"
+        if stamp.is_file():
+            try:
+                data = json.loads(stamp.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                return False
+            return isinstance(data, dict) and data.get("payload") == "bundled"
+    return False
+
+
+def sealed_bundle_deps_missing(sidecar_dir: Path) -> str:
+    """Why nothing installs the deps of a sidecar the resolver left inside a sealed bundle: it only
+    does that when mirroring to HERMES_HOME failed (baked, current deps run in place)."""
+    return (f"Photon sidecar deps are not installed, and {sidecar_dir} is inside the desktop app, which "
+            "must not be written to. Copying the sidecar to HERMES_HOME/photon/sidecar failed (see the "
+            "[photon] warning in the log); make HERMES_HOME writable and retry.")
+
+
 def dir_writable(path: Path) -> bool:
     """True when we can create files in ``path`` (probe, not stat — stat lies on root-squash
     / read-only bind mounts)."""
+    if _is_in_sealed_bundle(path):
+        return False
     probe = path / ".hermes-write-probe"
     try:
         probe.touch()
-        probe.unlink()
+        probe.unlink(missing_ok=True)
     except OSError:
         return False
     return True

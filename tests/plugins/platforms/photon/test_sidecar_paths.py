@@ -171,3 +171,141 @@ def test_mirror_falls_back_to_the_source_for_a_deleted_or_renamed_profile_home(t
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: home)
     assert sidecar_paths.resolve_sidecar_dir(source) == source
     assert not home.exists()
+
+
+def test_sealed_bundle_sidecar_mirrors_without_probing_source(tmp_path, monkeypatch) -> None:
+    """A user-writable sealed desktop bundle (macOS .app) must mirror to HERMES_HOME
+    without touching .hermes-write-probe inside the bundle."""
+    import json
+
+    monkeypatch.delenv("PHOTON_SIDECAR_DIR", raising=False)
+    bundle = tmp_path / "Hermes.app" / "Contents" / "Resources" / "agent-payload" / "hermes-agent"
+    source = bundle / "plugins" / "platforms" / "photon" / "sidecar"
+    _seed_source(source)
+    (bundle / "install-stamp.json").write_text(
+        json.dumps({"payload": "bundled", "distribution": "desktop-app"}), encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    touches: list[Path] = []
+    real_touch = Path.touch
+
+    def _track_touch(self, *a, **kw):
+        if bundle in self.parents or self == bundle:
+            touches.append(self)
+        return real_touch(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "touch", _track_touch)
+
+    assert sidecar_paths.dir_writable(source) is False
+    resolved = sidecar_paths.resolve_sidecar_dir(source)
+
+    expected = home / "photon" / "sidecar"
+    assert resolved == expected
+    assert touches == []
+    assert (expected / "index.mjs").exists()
+
+
+def test_sealed_bundle_with_baked_deps_runs_in_place_without_creating_lock(tmp_path, monkeypatch) -> None:
+    """When a sealed bundle carries fresh baked deps, Photon runs in place without
+    writing .hermes-write-probe or .photon-install.lock into the bundle."""
+    import json
+    from plugins.platforms.photon import adapter as photon_adapter
+
+    monkeypatch.delenv("PHOTON_SIDECAR_DIR", raising=False)
+    bundle = tmp_path / "Hermes.app" / "Contents" / "Resources" / "agent-payload" / "hermes-agent"
+    source = bundle / "plugins" / "platforms" / "photon" / "sidecar"
+    _seed_source(source, with_node_modules=True)
+    (source / "node_modules" / "spectrum-ts").mkdir()
+    os.utime(source / "package-lock.json", (1000.0, 1000.0))
+    os.utime(source / "node_modules" / ".package-lock.json", (2000.0, 2000.0))
+    (bundle / "install-stamp.json").write_text(
+        json.dumps({"payload": "bundled", "distribution": "desktop-app"}), encoding="utf-8",
+    )
+
+    resolved = sidecar_paths.resolve_sidecar_dir(source)
+    assert resolved == source
+
+    monkeypatch.setattr(sidecar_paths, "_SIDECAR_DIR", resolved)
+    photon_adapter._ensure_sidecar_deps_blocking()
+
+    assert not (source / ".photon-install.lock").exists()
+    assert not (source / ".hermes-write-probe").exists()
+
+
+def test_mirror_of_the_shipped_sidecar_carries_every_module(tmp_path, monkeypatch) -> None:
+    """index.mjs imports its sibling modules at load, so a mirror missing one can't start the sidecar (#85046).
+    Mirrors a copy of the real sidecar tree, not a fixture built from the mirror list."""
+    import shutil
+
+    monkeypatch.delenv("PHOTON_SIDECAR_DIR", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    source = tmp_path / "src"
+    shutil.copytree(sidecar_paths.SOURCE_SIDECAR_DIR, source, ignore=shutil.ignore_patterns("node_modules"))
+    _freeze_writability(monkeypatch, writable=False)
+
+    mirror = sidecar_paths.resolve_sidecar_dir(source)
+
+    shipped = {p.name for p in source.glob("*.mjs")}
+    assert "index.mjs" in shipped
+    assert mirror != source
+    assert shipped <= {p.name for p in mirror.glob("*.mjs")}
+
+
+def _sealed_bundle_sidecar(tmp_path, *, baked: bool) -> tuple[Path, Path]:
+    import json
+
+    bundle = tmp_path / "Hermes.app" / "Contents" / "Resources" / "agent-payload" / "hermes-agent"
+    source = bundle / "plugins" / "platforms" / "photon" / "sidecar"
+    _seed_source(source, with_node_modules=baked)
+    if baked:
+        (source / "node_modules" / "spectrum-ts").mkdir()
+    (bundle / "install-stamp.json").write_text(
+        json.dumps({"payload": "bundled", "distribution": "desktop-app"}), encoding="utf-8",
+    )
+    return bundle, source
+
+
+@pytest.mark.parametrize("baked", [True, False], ids=["baked-deps", "mirror-failed"])
+def test_install_sidecar_never_runs_npm_inside_a_sealed_bundle(tmp_path, monkeypatch, capsys, baked) -> None:
+    """`hermes photon setup` / `install-sidecar` install into the dir the resolver left. Inside a bundle that is
+    baked deps (nothing to do) or a failed mirror (say so): never npm or its error log inside the .app."""
+    import types
+    from plugins.platforms.photon import cli as photon_cli
+
+    bundle, source = _sealed_bundle_sidecar(tmp_path, baked=baked)
+    monkeypatch.setattr(sidecar_paths, "_SIDECAR_DIR", source)
+    monkeypatch.setattr(sidecar_paths, "_NPM_ERROR_LOG", None)
+    monkeypatch.setattr(photon_cli, "find_node_executable", lambda _name: "/usr/bin/npm")
+    runs: list[tuple] = []
+
+    def _fake_run(cmd, **kw):
+        runs.append((cmd, kw.get("cwd")))
+        return types.SimpleNamespace(returncode=1, stderr="npm ERR! EPERM")
+
+    monkeypatch.setattr(photon_cli.subprocess, "run", _fake_run)
+    before = sorted(p.relative_to(bundle) for p in bundle.rglob("*"))
+
+    rc = photon_cli._install_sidecar()
+
+    assert runs == []
+    assert sorted(p.relative_to(bundle) for p in bundle.rglob("*")) == before
+    assert rc == (0 if baked else 1)
+    if not baked:
+        assert "HERMES_HOME" in capsys.readouterr().err
+
+
+def test_sealed_bundle_without_deps_reports_the_failed_mirror_not_an_in_bundle_install(tmp_path, monkeypatch) -> None:
+    """The gateway's refusal must not tell the user to run npm inside the desktop app."""
+    from plugins.platforms.photon import adapter as photon_adapter
+
+    _bundle, source = _sealed_bundle_sidecar(tmp_path, baked=False)
+    monkeypatch.setattr(sidecar_paths, "_SIDECAR_DIR", source)
+
+    with pytest.raises(photon_adapter.PhotonSidecarStartupError) as excinfo:
+        photon_adapter._ensure_sidecar_deps_blocking()
+
+    assert "npm ci" not in str(excinfo.value)
+    assert "HERMES_HOME" in str(excinfo.value)

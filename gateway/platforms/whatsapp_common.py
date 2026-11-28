@@ -288,20 +288,48 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         return result
 
 
-def resolve_whatsapp_bridge_dir() -> Path:
-    """Bridge directory for CLI and adapter. A read-only install tree (e.g. Docker
-    /opt/hermes) is mirrored to HERMES_HOME so npm install works."""
-    import shutil
-    from hermes_constants import get_hermes_home
+def locate_whatsapp_bridge_dir(project_root: Optional[Path] = None) -> Path:
+    """Read-only bridge lookup for diagnostics: resolve_whatsapp_bridge_dir()'s choice without its write
+    probe or mirror copy. os.access stands in for the probe, so a leftover mirror never outranks a
+    writable install tree the bridge actually runs from."""
     from hermes_cli._startup_fast import project_root_str
-    install_bridge = Path(project_root_str()) / "scripts" / "whatsapp-bridge"
+    from hermes_cli.steward import is_bundled_payload
+    from hermes_constants import get_hermes_home
+
+    root = Path(project_root) if project_root is not None else Path(project_root_str())
+    install_bridge = root / "scripts" / "whatsapp-bridge"
     hermes_home_bridge = get_hermes_home() / "scripts" / "whatsapp-bridge"
-    try:
-        (install_bridge / ".write_test").touch()
-        (install_bridge / ".write_test").unlink()
+    if is_bundled_payload(root):
+        return hermes_home_bridge
+    if os.access(install_bridge, os.W_OK) or not hermes_home_bridge.exists():
         return install_bridge
-    except OSError:
-        pass
+    return hermes_home_bridge
+
+
+class WhatsAppBridgeUnavailable(RuntimeError):
+    """A sealed desktop bundle's bridge could not be mirrored out of the bundle."""
+
+
+def resolve_whatsapp_bridge_dir() -> Path:
+    """Bridge directory for CLI and adapter. A sealed desktop bundle or read-only
+    install tree (e.g. Docker /opt/hermes) is mirrored to HERMES_HOME so npm install works."""
+    import shutil
+    from hermes_cli._startup_fast import project_root_str
+    from hermes_cli.steward import is_bundled_payload
+    from hermes_constants import get_hermes_home, mkdir_under_hermes_home
+
+    project_root = Path(project_root_str())
+    install_bridge = project_root / "scripts" / "whatsapp-bridge"
+    hermes_home_bridge = get_hermes_home() / "scripts" / "whatsapp-bridge"
+    bundled = is_bundled_payload(project_root)
+    # A macOS .app bundle is user-writable, so probing it would mutate its code seal.
+    if not bundled:
+        try:
+            (install_bridge / ".write_test").touch()
+            (install_bridge / ".write_test").unlink()
+            return install_bridge
+        except OSError:
+            pass
     if hermes_home_bridge.exists():
         # Refresh the source on every resolve: a mirror frozen at its first copy would keep spawning a pre-update
         # bridge (one without /auth-proof can never pass the adapter's token proof). node_modules is the mirror's
@@ -313,8 +341,11 @@ def resolve_whatsapp_bridge_dir() -> Path:
             pass  # unreadable install tree: the mirror as it stands is still the best runnable copy
         return hermes_home_bridge
     try:
-        hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
+        mkdir_under_hermes_home(hermes_home_bridge.parent)
         shutil.copytree(install_bridge, hermes_home_bridge, dirs_exist_ok=False)
         return hermes_home_bridge
-    except Exception:
+    except Exception as exc:
+        if bundled:  # callers npm install into the dir they get, which would break the bundle's code seal
+            raise WhatsAppBridgeUnavailable(
+                f"Cannot copy the WhatsApp bridge out of the desktop app into {hermes_home_bridge}: {exc}") from exc
         return install_bridge

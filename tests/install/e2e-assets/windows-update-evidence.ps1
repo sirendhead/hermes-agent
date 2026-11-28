@@ -5,9 +5,11 @@
 param(
     [Parameter(Mandatory = $true)][string]$OutDir,
     [Parameter(Mandatory = $true)][datetime]$Since,
-    [Parameter(Mandatory = $true)][string]$Identity
+    [Parameter(Mandatory = $true)][string]$Identity,
+    [string]$OldInstallLocation = ''
 )
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'windows-process-records.ps1')
 $ours = [regex]::Escape($Identity) + '|msixbundle|appinstaller|127\.0\.0\.1'
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $packages = @(foreach ($name in 'Microsoft.DesktopAppInstaller', $Identity) {
@@ -17,6 +19,35 @@ ConvertTo-Json -InputObject $packages -Depth 3 | Set-Content -LiteralPath (Join-
 $installers = @(Get-Process -Name AppInstaller -ErrorAction SilentlyContinue | Select-Object Id, StartTime, Path)
 ConvertTo-Json -InputObject $installers | Set-Content -LiteralPath (Join-Path $OutDir 'appinstaller-processes.json') -Encoding UTF8
 foreach ($package in $packages) { Write-Host "  [evidence] $($package.Name) $($package.Version) $($package.Architecture) $($package.Status)" }
+$processPrefixes = @()
+if ($OldInstallLocation) { $processPrefixes += ($OldInstallLocation.TrimEnd('\') + '\') }
+foreach ($package in $packages) {
+    if ($package.Name -eq $Identity -and $package.InstallLocation) {
+        $prefix = $package.InstallLocation.TrimEnd('\') + '\'
+        if ($processPrefixes -notcontains $prefix) { $processPrefixes += $prefix }
+    }
+}
+$processPattern = [regex]::Escape($Identity) + '|hermes'
+try {
+    $matchedProcs = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+        $exe = $_.ExecutablePath
+        $cmd = $_.CommandLine
+        $underPrefix = $false
+        if ($exe) {
+            foreach ($prefix in $processPrefixes) {
+                if ($exe.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $underPrefix = $true; break }
+            }
+        }
+        $underPrefix -or ($exe -and $exe -match $processPattern) -or ($cmd -and $cmd -match $processPattern)
+    } | ForEach-Object { Format-ProcessRecord $_ })
+    ConvertTo-Json -InputObject $matchedProcs -Depth 3 | Set-Content -LiteralPath (Join-Path $OutDir 'processes.json') -Encoding UTF8
+    Write-Host "  [evidence] matching processes: $($matchedProcs.Count)"
+    foreach ($proc in $matchedProcs) { Write-Host "    $(Format-ProcessLine $proc)" }
+} catch {
+    $err = "could not read: $($_.Exception.Message)"
+    Set-Content -LiteralPath (Join-Path $OutDir 'processes-error.txt') -Value $err -Encoding UTF8
+    Write-Host "  [evidence] matching processes: $err"
+}
 # App Installer's own log names the HRESULT behind its dialogs. A bundle it cannot parse
 # leaves that only there, not in the AppX logs. Keep the files it wrote since the leg began.
 $diag = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir'
